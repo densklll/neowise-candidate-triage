@@ -8,28 +8,117 @@
     body { max-width: 40rem; margin: 2rem auto; padding: 0 1rem; font: 1rem/1.5 system-ui, sans-serif; }
     textarea { box-sizing: border-box; display: block; width: 100%; margin: .5rem 0; padding: .5rem; font: inherit; }
     button { padding: .4rem .8rem; font: inherit; }
-    pre { white-space: pre-wrap; }
+    button:disabled { cursor: progress; }
+    pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: .5rem; background: #f4f4f4; }
+    #status:empty { display: none; }
+    #status[data-kind="warning"] { padding: .5rem; background: #fff4d6; border-left: 4px solid #e0a800; }
+    #status[data-kind="error"] { padding: .5rem; background: #fde8e8; border-left: 4px solid #d33; }
   </style>
 </head>
 <body>
   <h1>Входящие заявки</h1>
-  <form>
+  <form novalidate>
     <label for="message">Текст заявки</label>
-    <textarea id="message" rows="4"></textarea>
+    <textarea id="message" rows="4" maxlength="10000"></textarea>
     <button type="submit">Разобрать заявку</button>
   </form>
-  <pre id="result" aria-live="polite"></pre>
+  <p id="status" role="status" aria-live="polite"></p>
+  <section id="result" hidden>
+    <p>Тема: <strong id="topic"></strong></p>
+    <p>Черновик ответа, проверьте перед отправкой клиенту:</p>
+    <pre id="draft"></pre>
+  </section>
   <script type="module">
     const form = document.querySelector("form");
+    const message = document.querySelector("#message");
+    const button = form.querySelector("button");
+    const statusLine = document.querySelector("#status");
     const result = document.querySelector("#result");
+    const topicEl = document.querySelector("#topic");
+    const draftEl = document.querySelector("#draft");
+
+    const TOPIC_LABELS = { delivery: "Доставка", pricing: "Цена", other: "Другое" };
+    const REQUEST_TIMEOUT_MS = 5000;
+    let lastRequestId = 0;
+
+    function showStatus(text, kind = "") {
+      statusLine.textContent = text;
+      statusLine.dataset.kind = kind;
+    }
+
+    function clearResult() {
+      result.hidden = true;
+      topicEl.textContent = "";
+      draftEl.textContent = "";
+    }
+
+    // Сервер тоже проверяет ответ модели, но страница не верит ему на слово
+    function toView(httpStatus, data) {
+      if (httpStatus === 200 && data?.status === "ready"
+          && Object.hasOwn(TOPIC_LABELS, data.topic)
+          && typeof data.draft === "string" && data.draft.trim()) {
+        return { topic: TOPIC_LABELS[data.topic], draft: data.draft };
+      }
+      // manual_review или ready с кривыми полями: в обоих случаях разбирает человек
+      if (httpStatus === 200 && (data?.status === "manual_review" || data?.status === "ready")) {
+        return { text: "AI не смог надежно разобрать заявку. Прочитайте ее и ответьте клиенту сами", kind: "warning" };
+      }
+      if (httpStatus === 400) return { text: "Введите текст заявки", kind: "error" };
+      if (httpStatus === 413) return { text: "Заявка слишком длинная, сократите текст", kind: "error" };
+      return { text: "Сервис сейчас не отвечает. Попробуйте еще раз или разберите заявку вручную", kind: "error" };
+    }
+
+    function render(view) {
+      if (view.draft) {
+        showStatus("");
+        topicEl.textContent = view.topic;
+        // только textContent: черновик пришел от модели, HTML в нем не исполняем
+        draftEl.textContent = view.draft;
+        result.hidden = false;
+      } else {
+        showStatus(view.text, view.kind);
+      }
+    }
+
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
-      const reply = await fetch("/api/triage", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: document.querySelector("#message").value }),
-      });
-      result.textContent = JSON.stringify(await reply.json(), null, 2);
+      if (button.disabled) return;
+
+      // старый черновик убираем сразу, чтобы его не приняли за ответ на новую заявку
+      clearResult();
+      const text = message.value;
+      if (!text.trim()) {
+        showStatus("Введите текст заявки", "error");
+        message.focus();
+        return;
+      }
+
+      const requestId = ++lastRequestId;
+      button.disabled = true;
+      message.readOnly = true;
+      form.setAttribute("aria-busy", "true");
+      showStatus("Разбираю заявку");
+
+      let view;
+      try {
+        const reply = await fetch("/api/triage", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
+        const data = await reply.json().catch(() => null);
+        view = toView(reply.status, data);
+      } catch {
+        view = toView(0, null);
+      }
+
+      // ответ на устаревший запрос не показываем
+      if (requestId !== lastRequestId) return;
+      button.disabled = false;
+      message.readOnly = false;
+      form.removeAttribute("aria-busy");
+      render(view);
     });
   </script>
 </body>
